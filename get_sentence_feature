@@ -1,0 +1,131 @@
+import os
+import torch
+# import fastBPE
+import linecache
+from tqdm import tqdm
+
+from xlm.utils import AttrDict
+from xlm.data.dictionary import Dictionary, BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD, MASK_WORD
+from xlm.model.transformer import TransformerModel
+
+model_path = '/home/ma-user/work/ding/code/XLM-main/xnli_model/mlm_tlm_xnli15_1024.pth'
+reloaded = torch.load(model_path)
+params = AttrDict(reloaded['params'])
+print("Supported languages: %s" % ", ".join(params.lang2id.keys()))
+
+# build dictionary / update parameters
+dico = Dictionary(reloaded['dico_id2word'], reloaded['dico_word2id'], reloaded['dico_counts'])
+params.n_words = len(dico)
+params.bos_index = dico.index(BOS_WORD)
+params.eos_index = dico.index(EOS_WORD)
+params.pad_index = dico.index(PAD_WORD)
+params.unk_index = dico.index(UNK_WORD)
+params.mask_index = dico.index(MASK_WORD)
+
+# build model / reload weights
+model = TransformerModel(params, dico, True, True)
+model.eval()
+model.load_state_dict(reloaded['model'])
+
+# Below is one way to bpe-ize sentences
+codes = "/home/ma-user/work/ding/code/XLM-main/xnli_model/codes_xnli_15.txt" # path to the codes of the model
+fastbpe = os.path.join(os.getcwd(), '/home/ma-user/work/ding/code/fastBPE-master/fast')
+
+
+
+file_out=open('/home/ma-user/work/ding/code/XLM-main/mlm_xlm/vec_layer1/wiki_xlm.en.vec','a')
+# file_out.write('200000'+' '+'1024'+'\n')
+
+
+# file_bpe = open('/home/ma-user/work/ding/data/wiki_bpe/train.en','r')
+# file_token = open('/home/ma-user/work/ding/data/wiki_fasttext/en.train','r')
+
+file_bpe = open('/home/ma-user/work/ding/data/parallel_corpora/en-zh/movie/OpenSubtitles.en-zh_cn_fenci.bpe.en','r')
+file_token = open('/home/ma-user/work/ding/data/parallel_corpora/en-zh/movie/OpenSubtitles.en-zh_cn_fenci.en','r')
+
+file_word=open('/home/ma-user/work/ding/code/CSCBLI-main/vecmap_xlm/vocab_1.txt','r')
+
+words=file_word.readlines()
+bpe_lines=file_bpe.readlines()
+token_lines=file_token.readlines()
+
+def get_sentences(w, bpe_lines, token_lines):
+
+    sents = []
+    bpe_sents = []
+    index_word_list = []
+    for l, bl in zip(token_lines, bpe_lines):
+        ws = l.strip().split()
+        if w in ws and len(bl.strip().split())<512:
+            sents.append(l.strip().split())
+            bpe_sents.append(bl.strip().split())
+            index_word = ws.index(w)
+            index_word_list.append(index_word)
+        if len(sents)>9:
+            break
+            
+    return sents, bpe_sents, index_word_list
+
+def bpe_alignment(token_sentences, bpe_sentences):
+
+    alignment_all = []
+    for token_sentence, bpe_sentence in zip(token_sentences, bpe_sentences):
+        alignment = []
+        i = 0
+        startj = 0
+        heBingBPE = ''
+        for j, bpe in enumerate(bpe_sentence):
+            if heBingBPE!='':
+                heBingBPE = heBingBPE + bpe.replace('@@', '')
+            else:
+                heBingBPE = bpe.replace('@@', '')
+            if heBingBPE == token_sentence[i]:
+                alignment.append([n for n in range(startj, j+1)])
+                startj = j+1
+                heBingBPE = ''
+                i = i+1
+            else:
+                continue
+        alignment_all.append(alignment)
+    return alignment_all        
+
+
+
+for w in tqdm(words):
+
+    w = w.strip()
+
+    sents, bpe_sents, w_index = get_sentences(w, bpe_lines, token_lines)
+    
+    if len(sents)>0:
+
+        alignment = bpe_alignment(sents, bpe_sents)
+
+        bs = len(bpe_sents)
+        slen = max([len(sent) for sent in bpe_sents])
+
+        word_ids = torch.LongTensor(slen, bs).fill_(params.pad_index)
+        for i in range(len(bpe_sents)):
+            sent = torch.LongTensor([dico.index(w) for w in bpe_sents[i]])
+            word_ids[:len(sent), i] = sent
+
+        lengths = torch.LongTensor([len(sent) for sent in bpe_sents])
+
+        langs = torch.LongTensor([params.lang2id['en']]).unsqueeze(0).expand(slen, bs)
+
+#         tensor, _ = model('fwd', x=word_ids, lengths=lengths, langs=langs, causal=False)
+        tensor = model('fwd', x=word_ids, lengths=lengths, langs=langs, causal=False)
+
+        al_index = [alignment[i][w_i] for i,w_i in enumerate(w_index)]
+        al_index = torch.Tensor(al_index).long()
+        t_1 = torch.cat([t[al_index[i]] for i, t in enumerate(tensor.transpose(0,1))])
+        if t_1.dim()>2:
+            t_1 = t_1.mean(dim=1).mean(dim=0) 
+        else:
+            t_1 = t_1.mean(dim=0)
+
+        file_out.write(w+' '+' '.join(list(map(str, t_1.tolist())))+'\n')
+        
+    else:
+        file_noFind = open('/home/ma-user/work/ding/code/XLM-main/mlm_xlm/vec_layer1/noFind.txt', 'a')
+        file_noFind.write(w+'\n')
